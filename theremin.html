@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aurora Theremin</title>
+<style>
+  html,body{margin:0;background:#080810;color:#eee;font-family:system-ui,sans-serif}
+  #wrap{max-width:920px;margin:0 auto;padding:12px}
+  #top{display:flex;gap:10px 14px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:14px}
+  button{background:#6c5ce7;color:#fff;border:0;border-radius:8px;padding:11px 18px;font-size:15px;cursor:pointer}
+  select{background:#1a1a2a;color:#eee;border:1px solid #444;border-radius:6px;padding:6px}
+  #stage{position:relative;aspect-ratio:4/3;background:#000;border-radius:14px;overflow:hidden}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+  video{opacity:.5}
+  #hud{position:absolute;left:14px;top:12px;font-size:30px;font-weight:600;text-shadow:0 2px 10px #000}
+  #hud small{display:block;font-size:14px;font-weight:400;opacity:.85}
+  #head{position:absolute;left:50%;top:6%;transform:translateX(-50%);font-size:12px;opacity:.5;text-align:center}
+  #vol{position:absolute;right:14px;top:12px;bottom:12px;width:14px;background:rgba(255,255,255,.12);border-radius:8px;overflow:hidden}
+  #volfill{position:absolute;left:0;right:0;bottom:0;height:0;background:linear-gradient(#ffd6ff,#a29bfe,#6c5ce7)}
+  #status{margin-top:8px;font-size:13px;opacity:.75;line-height:1.5}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="top">
+    <button id="start">▶ Start</button>
+    <label>Key <select id="key"></select></label>
+    <label>Mood <select id="scale">
+      <option value="mp">Minor pentatonic — dreamy</option>
+      <option value="dor">Dorian — cinematic</option>
+      <option value="maj">Major — bright</option>
+      <option value="pmaj">Major pentatonic — hopeful</option>
+      <option value="hm">Harmonic minor — dramatic</option>
+      <option value="phd">Phrygian dominant — desert</option>
+      <option value="free">Free glide — classic theremin</option>
+    </select></label>
+    <label>Magnet <input type="range" id="mag" min="0" max="100" value="70"></label>
+    <label>Vibrato <input type="range" id="vib" min="0" max="30" value="9"></label>
+    <label>Sensitivity <input type="range" id="sens" min="10" max="100" value="60"></label>
+    <label><input type="checkbox" id="dr" checked> Drone</label>
+  </div>
+  <div id="stage">
+    <video id="v" playsinline muted></video>
+    <canvas id="c" width="640" height="480"></canvas>
+    <div id="hud">—<small>press Start</small></div>
+    <div id="head">▲ keep your head here ▲</div>
+    <div id="vol"><div id="volfill"></div></div>
+  </div>
+  <div id="status"><b>One hand:</b> left↔right = pitch, up↕down = volume. <b>Two hands:</b> right hand = pitch, left hand = volume. The glowing lines are the notes of your scale — slide between them; <b>Magnet</b> makes the pitch settle on them. Wave a hand to grab it (bare hands, good light; the dashed oval at the top is ignored so your head isn't tracked).</div>
+</div>
+
+<script>
+const v=document.getElementById('v'), c=document.getElementById('c'), g=c.getContext('2d');
+const $=id=>document.getElementById(id), hud=$('hud'), volfill=$('volfill');
+const W=80, H=60, R=13;
+const small=document.createElement('canvas'); small.width=W; small.height=H;
+const sg=small.getContext('2d',{willReadFrequently:true});
+const prevG=new Float32Array(W*H), skin=new Uint8Array(W*H), mot=new Uint8Array(W*H);
+const NAMES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const SCALES={mp:[0,3,5,7,10],dor:[0,2,3,5,7,9,10],maj:[0,2,4,5,7,9,11],pmaj:[0,2,4,7,9],hm:[0,2,3,5,7,8,11],phd:[0,1,4,5,7,8,10],free:null};
+const SPAN_OCT=3;                                         // pitch range in octaves
+NAMES.forEach((n,i)=>{const o=document.createElement('option');o.value=i;o.textContent=n;$('key').appendChild(o);});
+$('key').value=2;                                         // default D
+let notes=[], low=50, tracks=[], frames=0, pos=.5, vy=0, lastSeen=0, mode1=true;
+let ctx, osc, osc2, amp, vibG, dr1, dr2, drG, curMidi=62;
+
+function setKey(){
+  const root=+$('key').value, iv=SCALES[$('scale').value];
+  low=48+root; notes=[];
+  if(iv) for(let o=0;o<SPAN_OCT;o++) iv.forEach(i=>notes.push(low+12*o+i));
+  if(iv) notes.push(low+12*SPAN_OCT);
+  if(ctx){ const t=ctx.currentTime; dr1.frequency.setTargetAtTime(mtof(36+root),t,.3); dr2.frequency.setTargetAtTime(mtof(43+root),t,.3); }
+}
+const mtof=m=>440*Math.pow(2,(m-69)/12);
+function magnet(m){                                       // pull pitch toward scale notes, keep the glide between them
+  if(!notes.length) return m;
+  if(m<=notes[0]) return notes[0];
+  if(m>=notes[notes.length-1]) return notes[notes.length-1];
+  let i=0; while(notes[i+1]<=m) i++;
+  const a=notes[i], b=notes[i+1], t=(m-a)/(b-a), k=1+5*$('mag').value/100;
+  const tk=Math.pow(t,k), t2=tk/(tk+Math.pow(1-t,k));
+  return a+t2*(b-a);
+}
+
+function initAudio(){
+  ctx=new (window.AudioContext||window.webkitAudioContext)();
+  const out=ctx.createGain(); out.gain.value=.9; out.connect(ctx.destination);
+  // reverb + dotted echo
+  const len=ctx.sampleRate*2.8, ir=ctx.createBuffer(2,len,ctx.sampleRate);
+  for(let ch=0;ch<2;ch++){const d=ir.getChannelData(ch);for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,2.6);}
+  const rev=ctx.createConvolver(); rev.buffer=ir; const revG=ctx.createGain(); revG.gain.value=.5; rev.connect(revG); revG.connect(out);
+  const dl=ctx.createDelay(1); dl.delayTime.value=.375; const fb=ctx.createGain(); fb.gain.value=.38;
+  const dlF=ctx.createBiquadFilter(); dlF.type='lowpass'; dlF.frequency.value=2200; const dlG=ctx.createGain(); dlG.gain.value=.35;
+  dl.connect(dlF); dlF.connect(fb); fb.connect(dl); dlF.connect(dlG); dlG.connect(out); dlG.connect(rev);
+  const bus=ctx.createGain(); bus.connect(out); bus.connect(rev); bus.connect(dl);
+  // voice
+  amp=ctx.createGain(); amp.gain.value=0;
+  const vf=ctx.createBiquadFilter(); vf.type='lowpass'; vf.frequency.value=3400; vf.Q.value=.6;
+  osc=ctx.createOscillator(); osc.type='sine';
+  osc2=ctx.createOscillator(); osc2.type='triangle'; osc2.detune.value=7;
+  const g2=ctx.createGain(); g2.gain.value=.2;
+  const lfo=ctx.createOscillator(); lfo.frequency.value=5.3; vibG=ctx.createGain(); vibG.gain.value=9;
+  lfo.connect(vibG); vibG.connect(osc.detune); vibG.connect(osc2.detune);
+  osc.connect(amp); osc2.connect(g2); g2.connect(amp); amp.connect(vf); vf.connect(bus);
+  // drone: root + fifth, slowly breathing
+  drG=ctx.createGain(); drG.gain.value=0;
+  const df=ctx.createBiquadFilter(); df.type='lowpass'; df.frequency.value=520;
+  dr1=ctx.createOscillator(); dr1.type='triangle'; dr2=ctx.createOscillator(); dr2.type='sine';
+  const dl2=ctx.createOscillator(); dl2.frequency.value=.11; const dlg=ctx.createGain(); dlg.gain.value=180; dl2.connect(dlg); dlg.connect(df.frequency);
+  dr1.connect(drG); dr2.connect(drG); drG.connect(df); df.connect(bus);
+  [osc,osc2,lfo,dr1,dr2,dl2].forEach(o=>o.start());
+  $('vib').oninput=e=>vibG.gain.value=+e.target.value;
+  setKey();
+}
+
+function analyse(S){
+  sg.drawImage(v,0,0,W,H);
+  const d=sg.getImageData(0,0,W,H).data;
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const i=y*W+x, r=d[i*4], gr=d[i*4+1], b=d[i*4+2];
+    const Y=.299*r+.587*gr+.114*b, cb=128-.169*r-.331*gr+.5*b, cr=128+.5*r-.419*gr-.081*b;
+    const fx=(x-W/2)/(W*.17), fy=(y-H*.33)/(H*.3);        // fixed head zone is ignored
+    skin[i]=(fx*fx+fy*fy>1&&cb>77&&cb<127&&cr>133&&cr<175&&Y>35)?1:0;
+    mot[i]=Math.abs(Y-prevG[i])>15?1:0; prevG[i]=Y;
+  }
+  if(frames<8) return;
+  for(const t of tracks){
+    let sx=0,sy=0,n=0;
+    const x0=Math.max(0,t.x-R|0), x1=Math.min(W-1,t.x+R|0), y0=Math.max(0,t.y-R|0), y1=Math.min(H-1,t.y+R|0);
+    for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){ const i=y*W+x; if(skin[i]){ const w=1+mot[i]; sx+=x*w; sy+=y*w; n+=w; } }
+    if(n>=14){ t.x+=(sx/n-t.x)*.7; t.y+=(sy/n-t.y)*.7; t.miss=0; } else t.miss++;
+  }
+  tracks=tracks.filter(t=>t.miss<10);
+  if(tracks.length<2){
+    let sx=0,sy=0,n=0;
+    for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+      const i=y*W+x;
+      if(skin[i]&&mot[i]&&tracks.every(t=>Math.abs(t.x-x)>R||Math.abs(t.y-y)>R)){ sx+=x; sy+=y; n++; }
+    }
+    if(n>=Math.round(30-S*22)) tracks.push({x:sx/n,y:sy/n,miss:0});
+  }
+  if(tracks.length===2 && Math.hypot(tracks[0].x-tracks[1].x,tracks[0].y-tracks[1].y)<R*.9) tracks.pop();
+}
+
+function play(S){
+  const now=performance.now(), cl=a=>Math.min(1,Math.max(0,a)), span=.9-.6*S, t=ctx.currentTime;
+  const hs=tracks.map(k=>({x:1-k.x/W,y:k.y/H})).sort((a,b)=>a.x-b.x);
+  let tp=null, tv=null, label='';
+  mode1=hs.length<2;
+  if(hs.length>=2){ tp=cl((hs[1].x-.5)/(span*.8)); tv=cl((.5+span/2-hs[0].y)/span); label='2 hands'; }
+  else if(hs.length===1){ tp=cl((hs[0].x-(.5-span/2))/span); tv=cl((.5+span/2-hs[0].y)/span); label='1 hand'; }
+  if(tp!==null){
+    lastSeen=now; pos+=(tp-pos)*.85; vy+=(tv-vy)*.8;
+    curMidi=magnet(low+pos*12*SPAN_OCT);
+    const f=mtof(curMidi);
+    osc.frequency.setTargetAtTime(f,t,.025); osc2.frequency.setTargetAtTime(f,t,.025);
+    amp.gain.setTargetAtTime(Math.pow(vy,1.5)*.55,t,.02);
+    drG.gain.setTargetAtTime($('dr').checked?.05:0,t,1.2);
+    const m=Math.round(curMidi);
+    hud.innerHTML=NAMES[((m%12)+12)%12]+(Math.floor(m/12)-1)+'<small>'+NAMES[+$('key').value]+' · '+$('scale').selectedOptions[0].textContent.split(' —')[0]+' · '+label+'</small>';
+    volfill.style.height=(vy*100)+'%';
+  }else if(now-lastSeen>250){
+    amp.gain.setTargetAtTime(0,t,.08); drG.gain.setTargetAtTime(0,t,1.5); volfill.style.height='0%';
+    hud.innerHTML='—<small>wave a hand to grab it</small>';
+  }
+}
+
+function draw(S){
+  g.clearRect(0,0,640,480);
+  const span=.9-.6*S;
+  notes.forEach(n=>{                                      // glowing note lanes (canvas is mirrored by CSS)
+    const p=(n-low)/(12*SPAN_OCT), sx=mode1?(.5-span/2)+p*span:.5+p*span*.8;
+    if(sx<0||sx>1) return;
+    const root=((n-low)%12+12)%12===0, x=(1-sx)*640;
+    const gr=g.createLinearGradient(0,0,0,480); gr.addColorStop(0,'rgba(162,155,254,0)'); gr.addColorStop(.5,root?'rgba(255,214,255,.55)':'rgba(162,155,254,.3)'); gr.addColorStop(1,'rgba(162,155,254,0)');
+    g.fillStyle=gr; g.fillRect(x-(root?2:1),0,root?4:2,480);
+  });
+  tracks.forEach(k=>{
+    const x=k.x/W*640, y=k.y/H*480;
+    const gr=g.createRadialGradient(x,y,4,x,y,70); gr.addColorStop(0,'rgba(200,190,255,.95)'); gr.addColorStop(1,'rgba(108,92,231,0)');
+    g.fillStyle=gr; g.beginPath(); g.arc(x,y,70,0,7); g.fill();
+    g.fillStyle='#fff'; g.beginPath(); g.arc(x,y,7,0,7); g.fill();
+  });
+  g.strokeStyle='rgba(255,255,255,.18)'; g.setLineDash([6,6]); g.lineWidth=2; g.beginPath(); g.ellipse(320,158,109,144,0,0,7); g.stroke(); g.setLineDash([]);
+}
+
+function loop(){
+  frames++;
+  const S=$('sens').value/100;
+  if(v.readyState>=2){ analyse(S); play(S); draw(S); }
+  if(v.requestVideoFrameCallback) v.requestVideoFrameCallback(loop); else requestAnimationFrame(loop);
+}
+
+$('key').onchange=$('scale').onchange=setKey;
+$('start').onclick=async()=>{
+  const b=$('start'); b.disabled=true; initAudio(); await ctx.resume();
+  try{
+    v.srcObject=await navigator.mediaDevices.getUserMedia({video:{width:160,height:120,facingMode:'user',frameRate:{ideal:60}}});
+    await v.play(); b.textContent='● Playing'; hud.innerHTML='—<small>wave a hand to grab it</small>'; loop();
+  }catch(e){ b.textContent='Error'; hud.innerHTML='—<small>camera: '+e.name+'</small>'; }
+};
+setKey();
+</script>
+</body>
+</html>
